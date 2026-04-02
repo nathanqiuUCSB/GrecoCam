@@ -6,35 +6,27 @@ import os
 
 # ── Config ────────────────────────────────────────────────────────────────────
 KNOWN_FACES_DIR = "known_faces"
-RECOGNITION_THRESHOLD = 0.32      # ← tightened: Facenet512 works best at 0.30–0.35
-MIN_FACE_SIZE = 48                 # ← NEW: skip crops smaller than this (px)
-RUN_RECOGNITION_EVERY = 8          # ← slightly more frequent for fresher labels
+CACHE_FILE = "face_cache.npz"
+RECOGNITION_THRESHOLD = 0.32
+RUN_RECOGNITION_EVERY = 8
 # ──────────────────────────────────────────────────────────────────────────────
 
-model = YOLO("yolov8n.pt")
+model = YOLO("yolo26n-face.pt")
 
-# ── Load known face embeddings ────────────────────────────────────────────────
-KNOWN_FACES_DIR = "known_faces"
-CACHE_FILE = "face_cache.npz"
-
+# ── Face cache ────────────────────────────────────────────────────────────────
 def get_file_mtimes(directory):
-    """Return a dict of filename -> mtime for all images in the directory."""
     mtimes = {}
     for f in os.listdir(directory):
         if f.lower().endswith((".jpg", ".jpeg", ".png")):
-            path = os.path.join(directory, f)
-            mtimes[f] = os.path.getmtime(path)
+            mtimes[f] = os.path.getmtime(os.path.join(directory, f))
     return mtimes
 
 def load_known_faces(directory, cache_file=CACHE_FILE):
     current_mtimes = get_file_mtimes(directory)
 
-    # Try loading cache
     if os.path.exists(cache_file):
         cache = np.load(cache_file, allow_pickle=True)
-        cached_mtimes = cache["mtimes"].item()  # dict stored as 0-d object array
-
-        if cached_mtimes == current_mtimes:
+        if cache["mtimes"].item() == current_mtimes:
             print("Loading faces from cache...")
             names = cache["names"].tolist()
             embeddings = cache["embeddings"]
@@ -42,10 +34,9 @@ def load_known_faces(directory, cache_file=CACHE_FILE):
             print(f"Loaded {len(known)} face(s) from cache\n")
             return known
 
-    # Cache miss or photos changed — recompute
-    print("Computing embeddings (this only runs when photos change)...")
+    print("Computing embeddings...")
     raw = {}
-    for filename, _ in current_mtimes.items():
+    for filename in current_mtimes:
         name = os.path.splitext(filename)[0].rsplit("_", 1)[0]
         path = os.path.join(directory, filename)
         try:
@@ -55,8 +46,7 @@ def load_known_faces(directory, cache_file=CACHE_FILE):
                 enforce_detection=True,
                 detector_backend="retinaface"
             )
-            embedding = np.array(result[0]["embedding"])
-            raw.setdefault(name, []).append(embedding)
+            raw.setdefault(name, []).append(np.array(result[0]["embedding"]))
             print(f"  ✓ {filename}")
         except Exception as e:
             print(f"  ✗ Skipped {filename}: {e}")
@@ -67,75 +57,23 @@ def load_known_faces(directory, cache_file=CACHE_FILE):
         known[name] = avg / np.linalg.norm(avg)
         print(f"  → {name}: {len(embeddings)} photos averaged")
 
-    # Save cache
     names = list(known.keys())
-    embeddings_array = np.stack([known[n] for n in names])
     np.savez(cache_file,
              names=names,
-             embeddings=embeddings_array,
+             embeddings=np.stack([known[n] for n in names]),
              mtimes=np.array(current_mtimes, dtype=object))
     print(f"Cache saved to {cache_file}\n")
-
     return known
 
 print("Loading known faces...")
 known_faces = load_known_faces(KNOWN_FACES_DIR)
+print(f"Loaded {len(known_faces)} face(s)\n")
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Recognition ───────────────────────────────────────────────────────────────
 def cosine_distance(a, b):
     return 1 - np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-def extract_face_crop(frame, x1, y1, x2, y2):
-    """
-    Extract a square-ish face crop from the upper portion of a person box.
-    
-    Strategy:
-      - Estimate face height as ~25% of person box height
-      - Make the crop square (width == height) centered horizontally
-      - Add 20% padding around the estimated face
-      - Clamp to frame bounds
-    
-    This is far more reliable than a flat 40% strip.
-    """
-    box_h = y2 - y1
-    box_w = x2 - x1
-
-    # Face occupies roughly the top 22% of a standing person
-    face_h = int(box_h * 0.22)
-    face_h = max(face_h, MIN_FACE_SIZE)
-
-    # Add padding
-    pad = int(face_h * 0.20)
-    face_h_padded = face_h + 2 * pad
-
-    # Square crop centered on the box top-center
-    cx = (x1 + x2) // 2
-    half = face_h_padded // 2
-
-    fx1 = max(cx - half, 0)
-    fx2 = min(cx + half, frame.shape[1])
-    fy1 = max(y1 - pad, 0)
-    fy2 = min(fy1 + face_h_padded, frame.shape[0])
-
-    crop = frame[fy1:fy2, fx1:fx2]
-    return crop
-
-def is_crop_usable(crop):
-    """Reject crops that are too small or too dark/blurry to encode reliably."""
-    if crop is None or crop.size == 0:
-        return False
-    h, w = crop.shape[:2]
-    if h < MIN_FACE_SIZE or w < MIN_FACE_SIZE:
-        return False
-    # Blur check: Laplacian variance — blurry images score very low
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    if cv2.Laplacian(gray, cv2.CV_64F).var() < 20:
-        return False
-    return True
-
 def identify_face(face_crop):
-    """Returns (name, confidence_str) or ('Unknown', '')"""
     try:
         result = DeepFace.represent(
             img_path=face_crop,
@@ -153,8 +91,7 @@ def identify_face(face_crop):
                 best_name = name
 
         if best_dist < RECOGNITION_THRESHOLD:
-            confidence = f"{(1 - best_dist) * 100:.0f}%"
-            return best_name.capitalize(), confidence
+            return best_name.capitalize(), f"{(1 - best_dist) * 100:.0f}%"
         return "Unknown", ""
 
     except Exception:
@@ -181,27 +118,19 @@ while True:
         break
 
     if frame_count % 2 == 0:
-        yolo_results = model(frame, classes=[0], verbose=False, imgsz=640)
+        face_results = model(frame, verbose=False, imgsz=640)
 
         if frame_count % RUN_RECOGNITION_EVERY == 0:
             last_detections = []
-            for result in yolo_results:
+            for result in face_results:
                 for box in result.boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     conf = float(box.conf[0])
                     if conf < 0.5:
                         continue
 
-                    # ── Better crop ──────────────────────────────────────
-                    face_crop = extract_face_crop(frame, x1, y1, x2, y2)
-
-                    # ── Quality gate ─────────────────────────────────────
-                    if not is_crop_usable(face_crop):
-                        last_detections.append({
-                            "box": (x1, y1, x2, y2),
-                            "label": "Unknown",
-                            "color": (100, 100, 100)   # gray = skipped
-                        })
+                    face_crop = frame[y1:y2, x1:x2]
+                    if face_crop.size == 0:
                         continue
 
                     name, face_conf = identify_face(face_crop)
@@ -214,7 +143,6 @@ while True:
                         "color": color
                     })
 
-    # ── Draw ──────────────────────────────────────────────────────────────
     for det in last_detections:
         x1, y1, x2, y2 = det["box"]
         color = det["color"]
