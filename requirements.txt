@@ -1,0 +1,15 @@
+# PC development (Windows/Linux desktop)
+opencv-python
+numpy
+ultralytics
+deepface
+edge-tts
+pygame
+pyttsx3
+
+# ── Jetson Orin Nano: do NOT pip install opencv-python ──
+# It breaks CSI camera support. On the Orin, run:
+#   sudo apt install python3-opencv espeak
+#   pip install numpy ultralytics deepface edge-tts pygame pyttsx3
+# Create venv with system OpenCV:
+#   python3 -m venv venv --system-site-packages
